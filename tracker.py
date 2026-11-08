@@ -3,12 +3,14 @@ import json, os, re, sys, time
 from pathlib import Path
 from datetime import datetime, timezone
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 
 ROOT = Path(__file__).resolve().parent
 STATE = ROOT / "state.json"
-UA = "Mozilla/5.0 (compatible; PS5StockChecker/1.0; personal noncommercial monitoring)"
-HEADERS = {"User-Agent": UA, "Accept-Language": "fr-FR,fr;q=0.9"}
+UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
+HEADERS = {"User-Agent": UA, "Accept-Language": "fr-FR,fr;q=0.9", "Accept": "text/html,application/xhtml+xml"}
 
 
 def normal(s):
@@ -80,19 +82,47 @@ def telegram(msg):
     return True
 
 
+def fetch(session, url):
+    """Récupération prudente ; pas de contournement de restrictions du site."""
+    response = session.get(url, headers=HEADERS, timeout=(10, 30), allow_redirects=True)
+    if response.status_code in (401, 403, 429):
+        return None, f"HTTP {response.status_code} (accès refusé ou limité)"
+    if response.status_code >= 400:
+        return None, f"HTTP {response.status_code} (page inaccessible ou déplacée)"
+    content_type = response.headers.get("Content-Type", "").lower()
+    if "html" not in content_type:
+        return None, f"réponse non HTML ({content_type[:60]})"
+    if not response.text.strip():
+        return None, "page vide"
+    return response.text, "ok"
+
+
 def run():
     products = json.loads((ROOT / "products.json").read_text(encoding="utf-8"))
     old = json.loads(STATE.read_text(encoding="utf-8")) if STATE.exists() else {}
     new = dict(old)
+    counts = {"available": 0, "unavailable": 0, "unknown": 0}
+    session = requests.Session()
+    retries = Retry(total=2, connect=2, read=1, backoff_factor=1,
+                    status_forcelist=[500, 502, 503, 504],
+                    allowed_methods=["GET"], respect_retry_after_header=True)
+    session.mount("https://", HTTPAdapter(max_retries=retries))
     for p in products:
         url = p["url"]
         print(f"Checking {p['store']} {p['name']}")
         try:
-            r = requests.get(url, headers=HEADERS, timeout=22)
-            r.raise_for_status()
-            status, reason = assess(p["mode"], r.text)
+            html, diagnostic = fetch(session, url)
+            if html is None:
+                status, reason = "unknown", diagnostic
+            else:
+                status, reason = assess(p["mode"], html)
+        except requests.exceptions.Timeout:
+            status, reason = "unknown", "délai dépassé après nouvelles tentatives"
+        except requests.exceptions.ConnectionError:
+            status, reason = "unknown", "connexion impossible après nouvelles tentatives"
         except (requests.RequestException, ValueError) as e:
-            status, reason = "unknown", f"erreur réseau ({type(e).__name__})"
+            status, reason = "unknown", f"erreur ({type(e).__name__})"
+        counts[status] += 1
         previous = old.get(url, "unknown")
         print(f"  {status}: {reason} / previous={previous}")
         # Never alert for unknown. Alert first confirmed availability, and a return after a confirmed outage.
@@ -106,7 +136,11 @@ def run():
             new[url] = status
         time.sleep(1.5)
     STATE.write_text(json.dumps(new, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print("Bilan:", counts, "sur", len(products), "fiches")
     print("Terminé", datetime.now(timezone.utc).isoformat())
+    if counts["unknown"] == len(products):
+        print("ÉCHEC : aucune fiche vérifiable. Ne pas confondre avec une rupture de stock.", file=sys.stderr)
+        sys.exit(1)
 
 if __name__ == "__main__":
     run()
